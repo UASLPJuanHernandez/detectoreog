@@ -18,11 +18,12 @@ import math
 # ─────────────────────────────────────────────
 #  CONFIGURACIÓN
 # ─────────────────────────────────────────────
-CLASES        = ["reposo", "izquierda", "derecha", "arriba", "abajo"]
+CLASES        = ["reposo", "izquierda", "derecha", "arriba", "abajo", "parpadeo"]
 FLECHAS       = {"reposo": "●", "izquierda": "←", "derecha": "→",
-                 "arriba": "↑", "abajo": "↓"}
+                 "arriba": "↑", "abajo": "↓", "parpadeo": "👁"}
 COLORES_CLASE = {"reposo": "#4A9EFF", "izquierda": "#FF6B6B",
-                 "derecha": "#FFD93D", "arriba": "#6BCB77", "abajo": "#C77DFF"}
+                 "derecha": "#FFD93D", "arriba": "#6BCB77", "abajo": "#C77DFF",
+                 "parpadeo": "#FF9F43"}
 
 TIEMPO_LINEA_BASE  = 0.3   # seg — mira al centro antes
 TIEMPO_MOVIMIENTO  = 1.5   # seg — duración de captura

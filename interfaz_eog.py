@@ -4,8 +4,9 @@ Requiere: modelo_eog.pkl  y  encoder_eog.pkl  (correr entrenar_eog.py primero)
 Uso: python3 interfaz_eog.py
 """
 
-import os, sys, time, threading, queue
+import os, sys, time, threading, queue, signal
 import numpy as np
+from scipy import stats
 import joblib
 import serial
 import serial.tools.list_ports
@@ -33,18 +34,21 @@ BUFFER_GRAF = 400   # puntos visibles en la gráfica
 VENTANA_CLS = 80    # puntos por clasificación (igual que entrenamiento)
 PASO_CLS    = 15    # clasificar cada N puntos nuevos
 VOTOS       = 5     # cuántas clasificaciones consecutivas para confirmar
-VOTOS_OK    = 4     # cuántas deben coincidir (de VOTOS) para disparar
-COOLDOWN    = 1.5   # segundos mínimos entre comandos
-CONF_MINIMA = 0.65  # confianza mínima por voto individual
+VOTOS_OK    = 3     # cuántas deben coincidir (de VOTOS) para disparar
+COOLDOWN    = 2.0   # segundos mínimos entre comandos
+CONF_MINIMA = 0.50  # confianza mínima por voto individual
+# Tras detectar una dirección, bloquear la opuesta extra tiempo (evita ojo volviendo al centro)
+OPUESTAS    = {"izquierda": "derecha", "derecha": "izquierda", "arriba": None}
 
-FLECHAS = {"izquierda": "←", "derecha": "→", "reposo": "●"}
+FLECHAS = {"izquierda": "←", "derecha": "→", "reposo": "●", "arriba": "↑"}
 COLORES = {
     "izquierda": "#FF6B6B",
     "derecha":   "#FFD93D",
     "reposo":    "#4A9EFF",
+    "arriba":    "#6BCB77",
     "–":         "#6B7280",
 }
-COMANDOS = {"izquierda": b'L', "derecha": b'R', "reposo": b'C'}
+COMANDOS = {"izquierda": b'L', "derecha": b'R', "reposo": b'C', "arriba": b'U'}
 
 BG      = "#0D0F14"
 BG2     = "#151820"
@@ -66,6 +70,21 @@ def extraer_features(seg):
     e_alta = fft[max(1, n//8):].mean()
     primera = seg[:25].mean()
     ultima  = seg[-25:].mean()
+    dir_pico      = seg.max() / rango if rango > 0 else 0.5
+    deriv         = np.diff(seg_n)
+    vel_max       = np.abs(deriv).max()
+    deriv_std     = deriv.std()
+    mid           = len(seg_n) // 2
+    asimetria     = seg_n[:mid].std() / (seg_n[mid:].std() + 1e-6)
+    pico_idx      = np.argmax(np.abs(seg_n))
+    pos_pico_abs  = pico_idx / len(seg_n)
+    media_segunda = seg_n[mid:].mean()
+
+    pend_subida = seg_n[pico_idx] / pico_idx if pico_idx > 0 else 0.0
+    resto = len(seg_n) - pico_idx
+    pend_bajada = (seg_n[-1] - seg_n[pico_idx]) / resto if resto > 1 else 0.0
+    sostenida     = (np.abs(seg_n) > 0.3).mean()
+    kurt          = stats.kurtosis(seg_n)
     return [[
         seg.max(), seg.min(), rango, seg.std(),
         seg.argmax() / len(seg), seg.argmin() / len(seg),
@@ -74,6 +93,10 @@ def extraer_features(seg):
         np.percentile(seg, 25), np.percentile(seg, 75), np.median(seg),
         e_baja, e_alta,
         primera, ultima, primera - ultima,
+        vel_max, deriv_std, asimetria, pos_pico_abs,
+        dir_pico, media_segunda,
+        sostenida, kurt,
+        pend_subida, pend_bajada,
     ]]
 
 # ══════════════════════════════════════════════════════════════════
@@ -98,7 +121,10 @@ class AppEOG:
         self._estado_inst = None
         self.prediccion   = "–"
         self.confianza    = 0.0
-        self.conteo       = {"izquierda": 0, "derecha": 0, "reposo": 0}
+        self.conteo       = {"izquierda": 0, "derecha": 0, "reposo": 0, "arriba": 0}
+        # Histéresis: bloquea la dirección opuesta para ignorar el ojo volviendo al centro
+        self._bloqueada   = None   # dirección bloqueada temporalmente
+        self._bloqueo_fin = 0.0   # timestamp hasta cuando está bloqueada
 
         self._after_id  = None
         self._construir_ui()
@@ -124,7 +150,7 @@ class AppEOG:
             self.line_graf.set_ydata(datos)
             yabs = max(np.abs(datos).max(), 20) * 1.2
             self.ax.set_ylim(-yabs, yabs)
-            self.canvas.draw_idle()
+            self.canvas.draw()
 
             self._after_id = self.root.after(80, self._tick)   # ~12 fps
         except tk.TclError:
@@ -248,7 +274,7 @@ class AppEOG:
         tk.Label(col_res, text="Detecciones", bg=BG2, fg=DIM,
                  font=("Helvetica", 11, "bold")).pack()
         self.lbl_conteo = {}
-        for clase in ("izquierda", "derecha", "reposo"):
+        for clase in ("izquierda", "derecha", "arriba", "reposo"):
             f = tk.Frame(col_res, bg=BG2)
             f.pack(fill="x", padx=20, pady=2)
             tk.Label(f, text=f"{FLECHAS[clase]} {clase}", bg=BG2,
@@ -385,18 +411,26 @@ class AppEOG:
             self.q.put(("log", f"ERROR: {e}"))
             return
 
+        # Ignorar dirección bloqueada por histéresis (ojo volviendo al centro)
+        ahora = time.time()
+        if self._bloqueada and ahora < self._bloqueo_fin and direccion == self._bloqueada:
+            direccion = "reposo"
+        elif ahora >= self._bloqueo_fin:
+            self._bloqueada = None
+
         # Solo contar votos con suficiente confianza
         voto = direccion if confianza >= CONF_MINIMA else "reposo"
         self.votos.append(voto)
 
         # Actualizar indicador de votación en log
-        resumen = f"votos: {list(self.votos)}  conf={confianza:.0%}"
+        bloq = f" [bloq:{self._bloqueada}]" if self._bloqueada else ""
+        resumen = f"votos: {list(self.votos)}  conf={confianza:.0%}{bloq}"
         self.q.put(("log", resumen))
 
-        # Comprobar consenso (solo para izq/der, no reposo)
+        # Comprobar consenso (solo para izq/der/arriba)
         if (len(self.votos) == VOTOS and
-                time.time() - self.ultimo_cmd > COOLDOWN):
-            for clase in ("izquierda", "derecha"):
+                ahora - self.ultimo_cmd > COOLDOWN):
+            for clase in ("izquierda", "derecha", "arriba"):
                 if self.votos.count(clase) >= VOTOS_OK:
                     self._disparar(clase, confianza)
                     self.votos.clear()
@@ -406,6 +440,12 @@ class AppEOG:
         self.ultimo_cmd = time.time()
         self.conteo[direccion] = self.conteo.get(direccion, 0) + 1
         color = COLORES.get(direccion, COLORES["–"])
+
+        # Bloquear dirección opuesta durante COOLDOWN extra (ignora ojo volviendo al centro)
+        opuesta = OPUESTAS.get(direccion)
+        if opuesta:
+            self._bloqueada   = opuesta
+            self._bloqueo_fin = time.time() + COOLDOWN + 0.8
 
         self.q.put(("pred_raw", direccion, confianza))
         self.q.put(("ultimo",
@@ -454,4 +494,6 @@ if __name__ == "__main__":
     root = tk.Tk()
     app  = AppEOG(root)
     root.protocol("WM_DELETE_WINDOW", app.cerrar)
+    # Route Ctrl+C through tkinter's event loop so it never interrupts mid-draw
+    signal.signal(signal.SIGINT, lambda *_: root.after(0, app.cerrar))
     root.mainloop()
