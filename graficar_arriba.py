@@ -104,17 +104,15 @@ txt_primera = ax1.text(2, y_lim * 0.88, "#1", color=SEP, fontsize=7, alpha=0.9)
 num_texts.insert(0, (0, txt_primera))
 
 ax1.set_xlim(0, ventana)
+ax1.set_title("scroll o ← → para navegar", color=DIM, fontsize=8, pad=4)
 
-ax_sl = fig1.add_axes([0.1, 0.05, 0.8, 0.04], facecolor=BG2)
-slider = widgets.Slider(ax_sl, "", 0, max(n_pts - ventana, 1),
-                        valinit=0, valstep=1, color=ACCENT)
-slider.label.set_color(DIM)
-slider.valtext.set_color(DIM)
-ax_sl.text(0.5, 1.5, "◀  desliza para navegar  ▶",
-           transform=ax_sl.transAxes, ha="center", color=DIM, fontsize=8)
+pos1 = [0]
+paso_scroll = max(1, ventana // 4)
 
-def update_slider(val):
-    ini, fin = int(slider.val), int(slider.val) + ventana
+def _mover_panorama(nuevo_ini):
+    ini = max(0, min(nuevo_ini, n_pts - ventana))
+    pos1[0] = ini
+    fin = ini + ventana
     line1.set_xdata(x_all[ini:fin])
     line1.set_ydata(señal[ini:fin])
     ax1.set_xlim(ini, fin)
@@ -124,13 +122,23 @@ def update_slider(val):
         xt.set_visible(ini <= g <= fin)
     fig1.canvas.draw_idle()
 
-slider.on_changed(update_slider)
+def _scroll_pan(event):
+    if event.button == "up":
+        _mover_panorama(pos1[0] - paso_scroll)
+    elif event.button == "down":
+        _mover_panorama(pos1[0] + paso_scroll)
 
-plt.figure(fig1.number)
-plt.savefig(os.path.join(os.path.dirname(os.path.abspath(archivo)),
-            f"arriba_{os.path.splitext(os.path.basename(archivo))[0]}.png"),
-            dpi=150, bbox_inches="tight", facecolor=BG)
-print("Imagen panorámica guardada.")
+def _key_pan(event):
+    if event.key == "left":
+        _mover_panorama(pos1[0] - paso_scroll)
+    elif event.key == "right":
+        _mover_panorama(pos1[0] + paso_scroll)
+
+fig1.canvas.mpl_connect("scroll_event", _scroll_pan)
+fig1.canvas.mpl_connect("key_press_event", _key_pan)
+
+_ruta_png = os.path.join(os.path.dirname(os.path.abspath(archivo)),
+            f"arriba_{os.path.splitext(os.path.basename(archivo))[0]}.png")
 
 # ══════════════════════════════════════════════════════════════════
 # FIGURA 2 — Una adquisición a la vez, número grande y prominente
@@ -213,3 +221,6 @@ except Exception:
     pass
 
 plt.show()
+
+fig1.savefig(_ruta_png, dpi=150, bbox_inches="tight", facecolor=BG)
+print("Imagen panorámica guardada.")

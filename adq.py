@@ -13,7 +13,11 @@ import time
 import os
 from datetime import datetime
 from collections import deque
-import math
+import numpy as np
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 # ─────────────────────────────────────────────
 #  CONFIGURACIÓN
@@ -67,13 +71,14 @@ class EOGApp(tk.Tk):
         self.muestras_totales    = {c: 0 for c in CLASES}
         self.muestras_objetivo   = 150
         self.clase_actual   = None
-        self.buffer_señal   = deque(maxlen=300)   # para mini-gráfica
+        self.buffer_señal   = deque([0.0] * 300, maxlen=300)   # para mini-gráfica
         self.capturando     = False
         self.captura_n      = 0
         self.captura_clase  = None
 
         self._build_ui()
         self._refresh_ports()
+        self._tick_grafica()
 
     # ──────────────────────────────────────────
     #  CONSTRUCCIÓN UI
@@ -229,15 +234,24 @@ class EOGApp(tk.Tk):
         self.pb.pack(padx=20, pady=(0, 8))
 
         # — Mini osciloscopio —
-        sec2 = tk.Frame(frame, bg=BG2, pady=8, padx=10)
+        sec2 = tk.Frame(frame, bg=BG2)
         sec2.grid(row=2, column=0, sticky="nsew", pady=(0, 8))
         tk.Label(sec2, text="SEÑAL EN TIEMPO REAL", font=("Courier New", 8, "bold"),
-                 bg=BG2, fg=ACCENT).pack(anchor="w", pady=(0, 4))
-        self.canvas_señal = tk.Canvas(sec2, bg=BG3, height=120,
-                                      highlightthickness=0)
-        self.canvas_señal.pack(fill="both", expand=True, padx=6, pady=6)
-        tk.Label(sec2, text="— H    — V",
-                 font=("Courier New", 8), bg=BG2, fg=TEXT_DIM).pack()
+                 bg=BG2, fg=ACCENT).pack(anchor="w", padx=10, pady=(8, 4))
+        self.fig, self.ax = plt.subplots(figsize=(7.5, 4), facecolor=BG2)
+        self.ax.set_facecolor(BG3)
+        for sp in self.ax.spines.values():
+            sp.set_edgecolor(TEXT_DIM)
+        self.ax.tick_params(colors=TEXT_DIM, labelsize=8)
+        self.ax.set_ylabel("amplitud (H)", color=TEXT_DIM, fontsize=9)
+        self.ax.set_xlabel("muestras recientes", color=TEXT_DIM, fontsize=9)
+        self.ax.axhline(0, color=TEXT_DIM, linewidth=0.5, linestyle="--")
+        self.ax.set_xlim(0, 300)
+        self.line_señal, = self.ax.plot(
+            np.arange(300), list(self.buffer_señal), color=ACCENT, linewidth=0.9)
+        self.fig.tight_layout(pad=1.2)
+        self.canvas_mpl = FigureCanvasTkAgg(self.fig, master=sec2)
+        self.canvas_mpl.get_tk_widget().pack(fill="both", expand=True)
 
         # — Log —
         sec3 = tk.Frame(frame, bg=BG2, pady=8, padx=10)
@@ -355,45 +369,27 @@ class EOGApp(tk.Tk):
             try:
                 linea = self.ser.readline().decode(errors="ignore").strip()
                 partes = linea.split(",")
-                if len(partes) != 2:
-                    continue
-                h = float(partes[0].strip())
-                v = float(partes[1].strip())
-                if abs(h) > 1000 or abs(v) > 1000 or abs(h - v) >= 50:
-                    continue
-                self.buffer_señal.append((h, v))
-                self.after(0, self._dibujar_señal)
-                if self.capturando and self.csv_writer:
-                    ts = int(time.time() * 1000)
-                    self.csv_writer.writerow([ts, h, v, self.captura_clase])
-                    self.captura_n += 1
+                if len(partes) == 2:
+                    h = float(partes[0].strip())
+                    v = float(partes[1].strip())
+                    if abs(h - v) < 50:
+                        self.buffer_señal.append(h)
+                        if self.capturando and self.csv_writer:
+                            ts = int(time.time() * 1000)
+                            self.csv_writer.writerow([ts, h, v, self.captura_clase])
+                            self.captura_n += 1
             except (ValueError, IndexError):
                 pass
             except:
                 pass
 
-    def _dibujar_señal(self):
-        c = self.canvas_señal
-        c.delete("all")
-        w = c.winfo_width()
-        h = c.winfo_height()
-        if w < 10 or h < 10 or len(self.buffer_señal) < 2:
-            return
+    def _tick_grafica(self):
         datos = list(self.buffer_señal)
-        n = len(datos)
-
-        c.create_line(0, h//2, w, h//2, fill=BG2, width=1)
-
-        def norm(val, mn=-1000, mx=1000):
-            return h - int((val - mn) / (mx - mn) * h)
-
-        pts = []
-        for i, pair in enumerate(datos):
-            x = int(i / n * w)
-            y = norm(pair[0])
-            pts.extend([x, y])
-        if len(pts) >= 4:
-            c.create_line(pts, fill=ACCENT, width=1, smooth=True)
+        self.line_señal.set_ydata(datos)
+        yabs = max(float(np.abs(datos).max()), 20) * 1.2
+        self.ax.set_ylim(-yabs, yabs)
+        self.canvas_mpl.draw()
+        self.after(80, self._tick_grafica)
 
     # ──────────────────────────────────────────
     #  ADQUISICIÓN

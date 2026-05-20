@@ -4,14 +4,13 @@ Uso: python3 entrenar_eog.py
 Genera: modelo_eog.pkl  y  encoder_eog.pkl
 """
 
-import os, csv
+import os, csv, pickle
 import numpy as np
 from scipy import stats
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import classification_report, confusion_matrix
-import joblib
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 
@@ -29,8 +28,8 @@ PASO    = 15   # paso del sliding window
 
 # Escalas por clase — arriba no baja de 0.7 para mantener separación de amplitud con parpadeo
 ESCALAS = {
-    "izquierda": [0.3, 0.5, 0.7, 1.0],
-    "derecha":   [0.3, 0.5, 0.7, 1.0],
+    "izquierda": [0.7, 0.85, 1.0],
+    "derecha":   [0.7, 0.85, 1.0],
     "arriba":    [0.7, 0.85, 1.0],
     "abajo":     [0.7, 0.85, 1.0],
     "reposo":    [1.0],
@@ -89,12 +88,37 @@ def extraer_features(seg):
     pend_bajada = (seg_n[-1] - seg_n[pico_idx]) / resto if resto > 1 else 0.0
 
     # "Sostenida": fracción del tiempo que la señal está por encima del 30% del pico
-    # arriba=0.40 >> izquierda=0.29 > parpadeo=0.25
     sostenida = (np.abs(seg_n) > 0.3).mean()
 
-    # Kurtosis: pico agudo (parpadeo/izq) = alta, señal sostenida (arriba) = baja
-    # arriba=0.005  izquierda=1.035  parpadeo=1.339
+    # Kurtosis: pico agudo = alta, señal sostenida = baja
     kurt = stats.kurtosis(seg_n)
+
+    # ── Dirección de tendencia normalizada ────────────────────────
+    n_ext = max(1, len(seg_n) // 8)        # ~12 % de la ventana (≈10 muestras en VENTANA=80)
+    inicio_n    = seg_n[:n_ext].mean()
+    fin_n       = seg_n[-n_ext:].mean()
+    tendencia_n = fin_n - inicio_n          # >0 = señal sube; <0 = señal baja
+
+    # Pendiente media por cuartos
+    cuarto = max(1, len(deriv) // 4)
+    deriv_inicio = deriv[:cuarto].mean()
+    deriv_final  = deriv[-cuarto:].mean()
+
+    # ── Features cuartos normalizados ────────────────────────────
+    n_q = max(1, len(seg_n) // 4)
+    q2_n       = seg_n[n_q:2*n_q].mean()
+    rango_q1_n = seg_n[:n_q].max() - seg_n[:n_q].min()
+
+    # Nivel final e inicial normalizados (explícitos, sin la resta de tendencia_n)
+    # fin_n distingue abajo (muy negativo al final) de arriba/izquierda (positivo)
+    # inicio_n distingue arriba/izquierda (negativo) de derecha/abajo (positivo)
+    fin_n_feat   = fin_n     # ya calculado arriba
+    inicio_n_feat = inicio_n  # ya calculado arriba
+
+    # Amplitud absoluta — discrimina arriba (>>9000) del resto (<2000)
+    amp_abs        = np.abs(seg).max()          # pico absoluto
+    amp_media      = np.mean(np.abs(seg))       # amplitud media sostenida
+    amp_sobre_3000 = float(amp_abs > 3000)      # 1.0 solo si es arriba-nivel
 
     return [
         seg.max(),
@@ -123,6 +147,16 @@ def extraer_features(seg):
         kurt,
         pend_subida,
         pend_bajada,
+        tendencia_n,
+        deriv_inicio,
+        deriv_final,
+        q2_n,
+        rango_q1_n,
+        fin_n_feat,
+        inicio_n_feat,
+        amp_abs,
+        amp_media,
+        amp_sobre_3000,
     ]
 
 FEATURE_NAMES = [
@@ -134,6 +168,10 @@ FEATURE_NAMES = [
     "dir_pico", "media_segunda",
     "sostenida", "kurtosis",
     "pend_subida", "pend_bajada",
+    "tendencia_n", "deriv_inicio", "deriv_final",
+    "q2_n", "rango_q1_n",
+    "fin_n", "inicio_n",
+    "amp_abs", "amp_media", "amp_sobre_3000",
 ]
 
 # ── Construir dataset con sliding windows ─────────────────────────
@@ -148,9 +186,17 @@ for etiqueta, archivo in ARCHIVOS.items():
     n_ventanas = 0
     for (lab, seg) in adqs:
         n = len(seg)
-        # Movimientos: solo primera mitad (sácada, sin el retorno)
-        # Reposo y parpadeo: ventana completa (no hay fase de retorno relevante)
-        limite = n if lab in ("reposo", "parpadeo") else n // 2
+        # Reposo/parpadeo: segmento completo.
+        # Arriba: garantiza al menos 2 ventanas de onset incluso para segmentos cortos
+        #   usando max(VENTANA+PASO+1, n//2). Evita fases medias/retorno que se
+        #   solapan con izquierda y abajo (el n-40 causaba falsas predicciones).
+        # Otros movimientos: primera mitad (fase de onset).
+        if lab in ("reposo", "parpadeo"):
+            limite = n
+        elif lab == "arriba":
+            limite = min(n, max(VENTANA + PASO + 1, n // 2))
+        else:
+            limite = n // 2
 
         escalas    = ESCALAS.get(lab, [1.0])
         media_base = seg.mean()
@@ -205,6 +251,8 @@ for nombre, imp in sorted(zip(FEATURE_NAMES, modelo.feature_importances_),
                            key=lambda x: -x[1]):
     print(f"  {nombre:16} {imp:.3f}  {'█' * int(imp * 40)}")
 
-joblib.dump(modelo, os.path.join(BASE, "modelo_eog.pkl"))
-joblib.dump(le,     os.path.join(BASE, "encoder_eog.pkl"))
+with open(os.path.join(BASE, "modelo_eog.pkl"), "wb") as f:
+    pickle.dump(modelo, f, protocol=pickle.HIGHEST_PROTOCOL)
+with open(os.path.join(BASE, "encoder_eog.pkl"), "wb") as f:
+    pickle.dump(le, f, protocol=pickle.HIGHEST_PROTOCOL)
 print(f"\nModelo guardado: modelo_eog.pkl  |  encoder_eog.pkl")

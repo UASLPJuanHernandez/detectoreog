@@ -5,28 +5,72 @@ Uso: python3 interfaz_eog.py
 """
 
 import os, sys, time, threading, queue, signal
-import numpy as np
-from scipy import stats
-import joblib
-import serial
-import serial.tools.list_ports
 import tkinter as tk
 from tkinter import ttk
-import matplotlib
-matplotlib.use("TkAgg")
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from collections import deque
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 
-# ── Cargar modelo ─────────────────────────────────────────────────
-try:
-    modelo  = joblib.load(os.path.join(BASE, "modelo_eog.pkl"))
-    encoder = joblib.load(os.path.join(BASE, "encoder_eog.pkl"))
-except FileNotFoundError:
-    print("ERROR: No se encontró modelo_eog.pkl — corre entrenar_eog.py primero.")
-    sys.exit(1)
+# ── Splash: carga librerías y modelo en hilo de fondo ─────────────
+class _Cargador:
+    def __init__(self):
+        self.win = tk.Tk()
+        self.win.title("EOG")
+        self.win.geometry("360x100")
+        self.win.configure(bg="#0D0F14")
+        self.win.resizable(False, False)
+        self.win.eval("tk::PlaceWindow . center")
+        tk.Label(self.win, text="EOG — Detección en tiempo real",
+                 bg="#0D0F14", fg="#00E5FF",
+                 font=("Courier New", 12, "bold")).pack(pady=(16, 6))
+        self.lbl = tk.Label(self.win, text="Importando librerías...",
+                            bg="#0D0F14", fg="#6B7280",
+                            font=("Courier New", 9))
+        self.lbl.pack()
+        self._q      = queue.Queue()
+        self.modelo  = None
+        self.encoder = None
+        threading.Thread(target=self._cargar, daemon=True).start()
+        self.win.after(100, self._poll)
+        self.win.mainloop()
+
+    def _cargar(self):
+        try:
+            import pickle
+            import numpy, scipy.stats, serial, serial.tools.list_ports
+            import matplotlib; matplotlib.use("TkAgg")
+            import matplotlib.pyplot, matplotlib.backends.backend_tkagg
+            self._q.put(("status", "Cargando modelo de clasificación..."))
+            with open(os.path.join(BASE, "modelo_eog.pkl"), "rb") as f:
+                m = pickle.load(f)
+            with open(os.path.join(BASE, "encoder_eog.pkl"), "rb") as f:
+                e = pickle.load(f)
+            self._q.put(("ok", m, e))
+        except FileNotFoundError:
+            self._q.put(("error", "No se encontró modelo_eog.pkl — corre entrenar_eog.py"))
+        except Exception as ex:
+            self._q.put(("error", str(ex)))
+
+    def _poll(self):
+        try:
+            while True:
+                msg = self._q.get_nowait()
+                if msg[0] == "status":
+                    self.lbl.config(text=msg[1])
+                elif msg[0] == "ok":
+                    self.modelo  = msg[1]
+                    self.encoder = msg[2]
+                    self.win.destroy()
+                    return
+                elif msg[0] == "error":
+                    self.lbl.config(text=msg[1], fg="#FF6B6B")
+                    tk.Button(self.win, text="Salir", command=sys.exit,
+                              bg="#FF6B6B", fg="white", relief="flat",
+                              font=("Courier New", 9)).pack(pady=6)
+                    return
+        except queue.Empty:
+            pass
+        self.win.after(100, self._poll)
 
 # ── Parámetros ────────────────────────────────────────────────────
 BAUD_RATE   = 115200
@@ -38,17 +82,29 @@ VOTOS_OK    = 3     # cuántas deben coincidir (de VOTOS) para disparar
 COOLDOWN    = 2.0   # segundos mínimos entre comandos
 CONF_MINIMA = 0.50  # confianza mínima por voto individual
 # Tras detectar una dirección, bloquear la opuesta extra tiempo (evita ojo volviendo al centro)
-OPUESTAS    = {"izquierda": "derecha", "derecha": "izquierda", "arriba": None}
+OPUESTAS    = {"izquierda": "derecha", "derecha": "izquierda", "arriba": "abajo", "abajo": "arriba"}
 
-FLECHAS = {"izquierda": "←", "derecha": "→", "reposo": "●", "arriba": "↑"}
+# ── Detección de onset ───────────────────────────────────────────
+# Cuando la señal se desvía abruptamente de la línea base se resetea el buffer
+# de clasificación para que el modelo siempre reciba el INICIO del movimiento
+# (igual que en entrenamiento, que usa la primera mitad del segmento).
+ONSET_FACTOR   = 4.0   # desviaciones estándar de línea base para disparar onset
+ONSET_MIN      = 150   # umbral mínimo absoluto (mV) — por encima del ruido base (~100 mV peak)
+BASE_VENTANA   = 200   # muestras para estimar línea base (~1 s a 200 Hz)
+POST_ONSET     = 200   # muestras de silencio después del onset antes de reanudar base
+ONSET_CONSEC   = 2     # muestras consecutivas por encima del umbral para disparar
+                        # (evita que picos de ruido aislados reseteen el buffer)
+
+FLECHAS = {"izquierda": "←", "derecha": "→", "reposo": "●", "arriba": "↑", "abajo": "↓"}
 COLORES = {
     "izquierda": "#FF6B6B",
     "derecha":   "#FFD93D",
     "reposo":    "#4A9EFF",
     "arriba":    "#6BCB77",
+    "abajo":     "#FF922B",
     "–":         "#6B7280",
 }
-COMANDOS = {"izquierda": b'L', "derecha": b'R', "reposo": b'C', "arriba": b'U'}
+COMANDOS = {"izquierda": b'L', "derecha": b'R', "reposo": b'C', "arriba": b'U', "abajo": b'D'}
 
 BG      = "#0D0F14"
 BG2     = "#151820"
@@ -85,6 +141,26 @@ def extraer_features(seg):
     pend_bajada = (seg_n[-1] - seg_n[pico_idx]) / resto if resto > 1 else 0.0
     sostenida     = (np.abs(seg_n) > 0.3).mean()
     kurt          = stats.kurtosis(seg_n)
+
+    # ── Dirección de tendencia normalizada (idéntico a entrenamiento) ──
+    n_ext        = max(1, len(seg_n) // 8)
+    inicio_n     = seg_n[:n_ext].mean()
+    fin_n        = seg_n[-n_ext:].mean()
+    tendencia_n  = fin_n - inicio_n
+    cuarto       = max(1, len(deriv) // 4)
+    deriv_inicio = deriv[:cuarto].mean()
+    deriv_final  = deriv[-cuarto:].mean()
+
+    n_q          = max(1, len(seg_n) // 4)
+    q2_n         = seg_n[n_q:2*n_q].mean()
+    rango_q1_n   = seg_n[:n_q].max() - seg_n[:n_q].min()
+    fin_n_feat   = fin_n
+    inicio_n_feat = inicio_n
+
+    amp_abs        = np.abs(seg).max()
+    amp_media      = np.mean(np.abs(seg))
+    amp_sobre_3000 = float(amp_abs > 3000)
+
     return [[
         seg.max(), seg.min(), rango, seg.std(),
         seg.argmax() / len(seg), seg.argmin() / len(seg),
@@ -97,6 +173,10 @@ def extraer_features(seg):
         dir_pico, media_segunda,
         sostenida, kurt,
         pend_subida, pend_bajada,
+        tendencia_n, deriv_inicio, deriv_final,
+        q2_n, rango_q1_n,
+        fin_n_feat, inicio_n_feat,
+        amp_abs, amp_media, amp_sobre_3000,
     ]]
 
 # ══════════════════════════════════════════════════════════════════
@@ -118,10 +198,16 @@ class AppEOG:
         self.votos        = deque(maxlen=VOTOS)
         self.n_nuevos     = 0
         self.ultimo_cmd   = 0.0
+
+        # Detección de onset — empieza vacío para no disparar onset falso con el DC offset inicial
+        self.base_buf        = deque(maxlen=BASE_VENTANA)
+        self.base_activa     = True   # True = acumulando línea base; False = post-onset
+        self.post_onset_cnt  = 0      # contador de muestras tras detectar onset
+        self.consec_sobre    = 0      # muestras consecutivas sobre el umbral (anti-ruido)
         self._estado_inst = None
         self.prediccion   = "–"
         self.confianza    = 0.0
-        self.conteo       = {"izquierda": 0, "derecha": 0, "reposo": 0, "arriba": 0}
+        self.conteo       = {"izquierda": 0, "derecha": 0, "reposo": 0, "arriba": 0, "abajo": 0}
         # Histéresis: bloquea la dirección opuesta para ignorar el ojo volviendo al centro
         self._bloqueada   = None   # dirección bloqueada temporalmente
         self._bloqueo_fin = 0.0   # timestamp hasta cuando está bloqueada
@@ -274,7 +360,7 @@ class AppEOG:
         tk.Label(col_res, text="Detecciones", bg=BG2, fg=DIM,
                  font=("Helvetica", 11, "bold")).pack()
         self.lbl_conteo = {}
-        for clase in ("izquierda", "derecha", "arriba", "reposo"):
+        for clase in ("izquierda", "derecha", "arriba", "abajo", "reposo"):
             f = tk.Frame(col_res, bg=BG2)
             f.pack(fill="x", padx=20, pady=2)
             tk.Label(f, text=f"{FLECHAS[clase]} {clase}", bg=BG2,
@@ -391,6 +477,36 @@ class AppEOG:
                 continue
 
             self.buf_graf.append(valor)
+
+            # ── Detección de onset ───────────────────────────────
+            # Compara el valor actual con la línea base reciente.
+            # Requiere ONSET_CONSEC muestras consecutivas sobre el umbral para
+            # disparar, evitando que picos de ruido aislados reseteen el buffer.
+            if self.base_activa:
+                self.base_buf.append(valor)
+                if len(self.base_buf) >= 50:
+                    base_mean = np.mean(list(self.base_buf))
+                    base_std  = max(np.std(list(self.base_buf)), 20)
+                    umbral    = max(ONSET_MIN, ONSET_FACTOR * base_std)
+                    if abs(valor - base_mean) > umbral:
+                        self.consec_sobre += 1
+                        if self.consec_sobre >= ONSET_CONSEC:
+                            # Onset confirmado: limpiar buffer para capturar desde inicio
+                            self.base_activa    = False
+                            self.post_onset_cnt = 0
+                            self.consec_sobre   = 0
+                            self.buf_cls.clear()
+                            self.n_nuevos = 0
+                            self.votos.clear()
+                    else:
+                        self.consec_sobre = 0
+            else:
+                self.post_onset_cnt += 1
+                if self.post_onset_cnt >= POST_ONSET:
+                    self.base_activa    = True
+                    self.post_onset_cnt = 0
+            # ── Fin detección de onset ──────────────────────────
+
             self.buf_cls.append(valor)
             self.n_nuevos += 1
 
@@ -411,6 +527,16 @@ class AppEOG:
             self.q.put(("log", f"ERROR: {e}"))
             return
 
+        # ── Regla dura: arriba SOLO si amp_abs > 3000 ────────────────
+        seg_raw    = np.array(list(self.buf_cls), dtype=float)
+        amp_abs_rt = float(np.abs(seg_raw - seg_raw.mean()).max())
+        if direccion == "arriba" and amp_abs_rt < 3000:
+            proba_tmp        = proba.copy()
+            proba_tmp[pred_idx] = 0
+            pred_idx  = int(proba_tmp.argmax())
+            confianza = float(proba_tmp.max())
+            direccion = str(encoder.inverse_transform([pred_idx])[0])
+
         # Ignorar dirección bloqueada por histéresis (ojo volviendo al centro)
         ahora = time.time()
         if self._bloqueada and ahora < self._bloqueo_fin and direccion == self._bloqueada:
@@ -420,17 +546,25 @@ class AppEOG:
 
         # Solo contar votos con suficiente confianza
         voto = direccion if confianza >= CONF_MINIMA else "reposo"
+
+        # ── Bloquea movimiento de retorno ────────────────────────────
+        # Si la dirección opuesta ya tiene votos en la ventana actual,
+        # este voto es el ojo volviendo al centro → ignóralo
+        opuesta_voto = OPUESTAS.get(voto)
+        if opuesta_voto and self.votos.count(opuesta_voto) > 0:
+            voto = "reposo"
+
         self.votos.append(voto)
 
         # Actualizar indicador de votación en log
         bloq = f" [bloq:{self._bloqueada}]" if self._bloqueada else ""
-        resumen = f"votos: {list(self.votos)}  conf={confianza:.0%}{bloq}"
+        resumen = f"votos: {list(self.votos)}  conf={confianza:.0%}  amp={amp_abs_rt:.0f}{bloq}"
         self.q.put(("log", resumen))
 
         # Comprobar consenso (solo para izq/der/arriba)
         if (len(self.votos) == VOTOS and
                 ahora - self.ultimo_cmd > COOLDOWN):
-            for clase in ("izquierda", "derecha", "arriba"):
+            for clase in ("izquierda", "derecha", "arriba", "abajo"):
                 if self.votos.count(clase) >= VOTOS_OK:
                     self._disparar(clase, confianza)
                     self.votos.clear()
@@ -491,9 +625,26 @@ class AppEOG:
 
 # ── Main ──────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    # Splash: carga librerías y modelo en hilo de fondo
+    _cargador = _Cargador()   # mainloop() interno — regresa cuando termina
+    modelo    = _cargador.modelo
+    encoder   = _cargador.encoder
+    if modelo is None:
+        sys.exit(1)
+
+    # Imports ya cacheados por el hilo → instantáneos aquí
+    import numpy as np
+    from scipy import stats
+    import pickle
+    import serial
+    import serial.tools.list_ports
+    import matplotlib
+    matplotlib.use("TkAgg")
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
     root = tk.Tk()
     app  = AppEOG(root)
     root.protocol("WM_DELETE_WINDOW", app.cerrar)
-    # Route Ctrl+C through tkinter's event loop so it never interrupts mid-draw
     signal.signal(signal.SIGINT, lambda *_: root.after(0, app.cerrar))
     root.mainloop()
