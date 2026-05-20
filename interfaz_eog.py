@@ -89,7 +89,7 @@ OPUESTAS    = {"izquierda": "derecha", "derecha": "izquierda", "arriba": "abajo"
 # de clasificación para que el modelo siempre reciba el INICIO del movimiento
 # (igual que en entrenamiento, que usa la primera mitad del segmento).
 ONSET_FACTOR   = 4.0   # desviaciones estándar de línea base para disparar onset
-ONSET_MIN      = 150   # umbral mínimo absoluto (mV) — por encima del ruido base (~100 mV peak)
+ONSET_MIN      = 500   # umbral mínimo absoluto (mV) — filtra ruido, movimientos reales >1000
 BASE_VENTANA   = 200   # muestras para estimar línea base (~1 s a 200 Hz)
 POST_ONSET     = 200   # muestras de silencio después del onset antes de reanudar base
 ONSET_CONSEC   = 2     # muestras consecutivas por encima del umbral para disparar
@@ -547,11 +547,18 @@ class AppEOG:
         # Solo contar votos con suficiente confianza
         voto = direccion if confianza >= CONF_MINIMA else "reposo"
 
-        # ── Bloquea movimiento de retorno ────────────────────────────
-        # Si la dirección opuesta ya tiene votos en la ventana actual,
-        # este voto es el ojo volviendo al centro → ignóralo
+        # ── Bloquea movimiento de retorno (opuestos) ─────────────────
+        # Si la dirección opuesta ya tiene votos, es el ojo volviendo al centro
         opuesta_voto = OPUESTAS.get(voto)
         if opuesta_voto and self.votos.count(opuesta_voto) > 0:
+            voto = "reposo"
+
+        # ── Bloquea abajo/arriba si ya hay votos horizontales ────────
+        # La fase de retorno de izq/der cae igual que abajo → descartarla
+        HORIZONTALES = ("izquierda", "derecha")
+        if voto == "abajo" and any(v in HORIZONTALES for v in self.votos):
+            voto = "reposo"
+        if voto == "arriba" and any(v in HORIZONTALES for v in self.votos):
             voto = "reposo"
 
         self.votos.append(voto)
