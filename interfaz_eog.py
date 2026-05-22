@@ -530,7 +530,7 @@ class AppEOG:
         # ── Regla dura: arriba SOLO si amp_abs > 3000 ────────────────
         seg_raw    = np.array(list(self.buf_cls), dtype=float)
         amp_abs_rt = float(np.abs(seg_raw - seg_raw.mean()).max())
-        if direccion == "arriba" and amp_abs_rt < 3000:
+        if direccion == "arriba" and amp_abs_rt < 1500:
             proba_tmp        = proba.copy()
             proba_tmp[pred_idx] = 0
             pred_idx  = int(proba_tmp.argmax())
