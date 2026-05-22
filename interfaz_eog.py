@@ -608,6 +608,11 @@ class AppEOG:
         def volver_listo():
             time.sleep(COOLDOWN)
             if self.leyendo:
+                if self.ser:
+                    try:
+                        self.ser.write(b'C')
+                    except Exception:
+                        pass
                 self._estado_inst = None
                 self._instruccion("listo",
                     "Mueve el ojo cuando quieras   →  ←  ●", SUCCESS)
